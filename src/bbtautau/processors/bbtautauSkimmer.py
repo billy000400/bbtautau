@@ -33,7 +33,7 @@ from boostedhh.processors.utils import (
 from coffea import processor
 from coffea.analysis_tools import PackedSelection, Weights
 
-from bbtautau import bbtautau_vars
+from bbtautau.HLTs import HLTs
 
 from . import GenSelection, objects
 
@@ -61,6 +61,10 @@ class bbtautauSkimmer(SkimmerABC):
             **P4,
             "rawFactor": "rawFactor",
             "btagPNetB": "btagPNetB",
+        },
+        "MET": {
+            "pt": "Pt",
+            "phi": "Phi",
         },
         "Lepton": {
             **P4,
@@ -144,15 +148,15 @@ class bbtautauSkimmer(SkimmerABC):
         save_systematics: bool = False,
         region: str = "signal",
         nano_version: str = "v12_private",
+        fatjet_pt_cut: float = None,
     ):
         super().__init__()
 
         self.XSECS = xsecs if xsecs is not None else {}  # in pb
 
         # HLT selection
-        HLTs = {"signal": bbtautau_vars.HLT_list}
-
-        self.HLTs = HLTs[region]
+        self.HLTs = {"signal": HLTs.hlt_list(hlt_prefix=False)}
+        self.HLTs = self.HLTs[region]
         self._systematics = save_systematics
         self._nano_version = nano_version
         self._region = region
@@ -210,7 +214,13 @@ class bbtautauSkimmer(SkimmerABC):
             **{f"globalParT_{var}": f"ParT{var}" for var in glopart_vars},
         }
 
-        logger.info(f"Running skimmer with systematics {self._systematics}")
+        # update fatjet pT cut
+        if fatjet_pt_cut is not None:
+            self.fatjet_selection["pt"] = fatjet_pt_cut
+
+        logger.info(
+            f"Running skimmer with:\nsystematics {self._systematics}\nregion {self._region}\nfatjet pt cut {self.fatjet_selection['pt']}"
+        )
 
     @property
     def accumulator(self):
@@ -220,8 +230,7 @@ class bbtautauSkimmer(SkimmerABC):
         """Runs event processor for different types of jets"""
 
         start = time.time()
-        print("Starting")
-        print("# events", len(events))
+        logging.info(f"# events {len(events)}")
 
         year = events.metadata["dataset"].split("_")[0]
         dataset = "_".join(events.metadata["dataset"].split("_")[1:])
@@ -455,14 +464,18 @@ class bbtautauSkimmer(SkimmerABC):
         #             label = "" if shift == "" else "_" + shift
         #             bbFatJetVars[f"bbFatJet{key}{label}"] = vals
 
+        # MET
+        metVars = {
+            f"MET{key}": pad_val(met[var], 1, axis=1)
+            for (var, key) in self.skim_vars["MET"].items()
+        }
+
         # Event variables
-        met_pt = met.pt
         eventVars = {
             key: events[val].to_numpy()
             for key, val in self.skim_vars["Event"].items()
             if key in events.fields
         }
-        eventVars["MET_pt"] = met_pt.to_numpy()
         eventVars["ht"] = ht.to_numpy()
         eventVars["nElectrons"] = ak.num(electrons).to_numpy()
         eventVars["nMuons"] = ak.num(muons).to_numpy()
@@ -481,11 +494,11 @@ class bbtautauSkimmer(SkimmerABC):
         HLTVars = {}
         zeros = np.zeros(len(events), dtype="int")
         for trigger in self.HLTs[year]:
-            if trigger[4:] in events.HLT.fields:
-                HLTVars[trigger] = events.HLT[trigger[4:]].to_numpy().astype(int)
+            if trigger in events.HLT.fields:
+                HLTVars[f"HLT_{trigger}"] = events.HLT[trigger].to_numpy().astype(int)
             else:
                 logger.warning(f"Missing {trigger}!")
-                HLTVars[trigger] = zeros
+                HLTVars[f"HLT_{trigger}"] = zeros
 
         print("HLT vars", f"{time.time() - start:.2f}")
 
@@ -516,6 +529,7 @@ class bbtautauSkimmer(SkimmerABC):
             **leptonVars,
             **ak4JetVars,
             **ak8FatJetVars,
+            **metVars,
             # **bbFatJetVars,
             # **trigObjFatJetVars,
             # **vbfJetVars,
@@ -537,11 +551,7 @@ class bbtautauSkimmer(SkimmerABC):
 
         HLT_triggered = np.any(
             np.array(
-                [
-                    events.HLT[trigger[4:]]
-                    for trigger in self.HLTs[year]
-                    if trigger[4:] in events.HLT.fields
-                ]
+                [events.HLT[trigger] for trigger in self.HLTs[year] if trigger in events.HLT.fields]
             ),
             axis=0,
         )
@@ -565,9 +575,12 @@ class bbtautauSkimmer(SkimmerABC):
         # # >=2 AK8 jets passing selections
         # add_selection("ak8_numjets", (ak.num(fatjets) >= 2), *selection_args)
 
-        # >=1 AK8 jets with pT>230 GeV
-        cut_pt = np.sum(ak8FatJetVars["ak8FatJetPt"] >= self.fatjet_selection["pt"], axis=1) >= 1
-        add_selection("ak8_pt", cut_pt, *selection_args)
+        # >=1 AK8 jets with pT cut (230 GeV by default)
+        if self.fatjet_selection["pt"] >= 0:  # if < 0, don't apply any fatjet selection
+            cut_pt = (
+                np.sum(ak8FatJetVars["ak8FatJetPt"] >= self.fatjet_selection["pt"], axis=1) >= 1
+            )
+            add_selection("ak8_pt", cut_pt, *selection_args)
 
         # # >=1 AK8 jets with mSD >= 40 GeV
         # cut_mass = np.sum(ak8FatJetVars["ak8FatJetMsd"] >= 40, axis=1) >= 1
@@ -628,6 +641,8 @@ class bbtautauSkimmer(SkimmerABC):
         dataframe = self.to_pandas(skimmed_events)
         fname = events.behavior["__events_factory__"]._partition_key.replace("/", "_") + ".parquet"
         self.dump_table(dataframe, fname)
+
+        logger.info(f"Cutflow:\n{cutflow}")
 
         print("Return ", f"{time.time() - start:.2f}")
         print("Columns:", print(list(dataframe.columns)))
@@ -692,6 +707,7 @@ class bbtautauSkimmer(SkimmerABC):
             weights_dict[f"single_weight_{key}"] = weights.partial_weight([key])
 
         ###################### alpha_S and PDF variations ######################
+
         if ("HHTobbbb" in dataset or "HHto4B" in dataset) or dataset.startswith("TTTo"):
             scale_weights = get_scale_weights(events)
             if scale_weights is not None:
